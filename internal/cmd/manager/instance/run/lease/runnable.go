@@ -93,14 +93,20 @@ type Runnable struct {
 	lock     resourcelock.Interface
 
 	// config holds the lease timings. It is initialised to the defaults by New
-	// and overwritten by the first Acquire call before the runnable activates.
+	// and overwritten by the first Acquire call of each election generation.
 	config Config
 
-	// activateCh is closed by the first Acquire call to unblock Start.
+	// mu serializes election generations and cancellation with acquisition.
+	// Reconciliation is the only caller that may cancel a candidate: it must
+	// do so before attempting another promotion on this instance.
+	mu         sync.Mutex
+	generation *electionGeneration
+
+	// activateCh is closed by the first Acquire call in each generation.
 	activateCh   chan struct{}
 	activateOnce sync.Once
 
-	// heldCh is closed once the lease has been successfully acquired for the first time.
+	// heldCh is closed when this generation first acquires the lease.
 	heldCh   chan struct{}
 	heldOnce sync.Once
 
@@ -111,6 +117,16 @@ type Runnable struct {
 	// they need no synchronisation.
 	observedRecord *resourcelock.LeaderElectionRecord
 	observedTime   time.Time
+}
+
+// electionGeneration owns one acquisition/renewal lifecycle. A cancelled
+// candidate is joined before releasing its lease or accepting a new generation.
+// A caller's Acquire timeout does not cancel this lifecycle.
+type electionGeneration struct {
+	ctx    context.Context
+	cancel context.CancelFunc
+	done   chan struct{}
+	reset  chan struct{}
 }
 
 // New creates a new Runnable.
@@ -142,25 +158,105 @@ func New(
 
 // Acquire signals the runnable to start competing for the lease using the
 // provided configuration, then blocks until the lease is held or ctx is
-// cancelled. The configuration is only applied by the first call; subsequent
-// calls reuse the timings captured at activation time.
+// cancelled. The configuration is captured by the first call of each generation.
+// Retries reuse it until CancelCandidate has fully retired that generation.
 func (r *Runnable) Acquire(ctx context.Context, config Config) error {
-	contextLogger := log.FromContext(ctx)
-
+	for {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		r.mu.Lock()
+		previous := r.generation
+		if previous == nil || previous.ctx.Err() == nil {
+			break
+		}
+		r.mu.Unlock()
+		// An earlier release may have failed while the API was unavailable. A new
+		// selection must complete that retirement, rather than stay permanently
+		// attached to the cancelled generation or reuse its held notification.
+		if err := r.CancelCandidate(ctx); err != nil {
+			return err
+		}
+		r.mu.Lock()
+		unchanged := r.generation == previous
+		r.mu.Unlock()
+		if unchanged {
+			return fmt.Errorf("cannot retire primary lease generation while primary data is present")
+		}
+	}
 	r.activateOnce.Do(func() {
-		// Set the config before closing activateCh: the channel close
-		// establishes the happens-before edge that lets Start read it safely.
 		r.config = config
-		contextLogger.Info("Acquiring primary lease")
+		generationCtx, cancel := context.WithCancel(context.Background())
+		r.generation = &electionGeneration{ctx: generationCtx, cancel: cancel, done: make(chan struct{}), reset: make(chan struct{})}
+		log.FromContext(ctx).Info("Acquiring primary lease")
 		close(r.activateCh)
 	})
-
+	generation := r.generation
+	held := r.heldCh
+	r.mu.Unlock()
 	select {
-	case <-r.heldCh:
+	case <-held:
+		// Never report ownership from a cancelled generation's closed held channel.
+		if err := generation.ctx.Err(); err != nil {
+			return err
+		}
 		return nil
+	case <-generation.ctx.Done():
+		return generation.ctx.Err()
 	case <-ctx.Done():
 		return ctx.Err()
 	}
+}
+
+// CancelCandidate stops an obsolete candidate and releases any lease it acquired.
+// A primary (including an offline primary PGDATA) keeps its election and lease;
+// only the normal shutdown path may release that ownership. The reconciler
+// serializes this call with startup and promotion. Ambiguous local role is an
+// error, never permission to release. Renewal is fully joined before release.
+func (r *Runnable) CancelCandidate(ctx context.Context) error {
+	r.mu.Lock()
+	generation := r.generation
+	if generation == nil {
+		r.mu.Unlock()
+		return nil
+	}
+	primary, err := r.instance.IsPrimary()
+	if err != nil {
+		r.mu.Unlock()
+		return err
+	}
+	if primary || r.instance.InstanceManagerIsUpgrading.Load() {
+		r.mu.Unlock()
+		return nil
+	}
+	// Keep a failed API release bounded; a later reconcile or selection retries
+	// retirement, with the old renewal loop still stopped.
+	ctx, cancel := context.WithTimeout(ctx, r.config.RenewDeadline)
+	defer cancel()
+	generation.cancel()
+	r.mu.Unlock()
+	select {
+	case <-generation.done:
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.generation != generation {
+		return nil
+	}
+	if err := r.Release(ctx); err != nil {
+		return err
+	}
+	r.observedRecord = nil
+	r.observedTime = time.Time{}
+	r.activateCh = make(chan struct{})
+	r.activateOnce = sync.Once{}
+	r.heldCh = make(chan struct{})
+	r.heldOnce = sync.Once{}
+	r.generation = nil
+	close(generation.reset)
+	return nil
 }
 
 // Release explicitly releases the lease so that a replica can promote without
@@ -231,13 +327,38 @@ func (r *Runnable) Release(ctx context.Context) error {
 // The runnable stays idle until Acquire is called, then enters the
 // lease acquisition/renewal loop.
 func (r *Runnable) Start(ctx context.Context) error {
-	select {
-	case <-r.activateCh:
-		// proceed to active mode
-	case <-ctx.Done():
-		return nil
+	for {
+		r.mu.Lock()
+		activate := r.activateCh
+		r.mu.Unlock()
+		select {
+		case <-activate:
+		case <-ctx.Done():
+			return nil
+		}
+		r.mu.Lock()
+		generation := r.generation
+		r.mu.Unlock()
+		runCtx, cancel := context.WithCancel(ctx)
+		stop := context.AfterFunc(generation.ctx, cancel)
+		// AfterFunc schedules cancellation asynchronously. Close that small startup
+		// window explicitly when a candidate was already cancelled before Start.
+		if generation.ctx.Err() != nil {
+			cancel()
+		}
+		err := r.runLeaderElection(runCtx)
+		stop()
+		cancel()
+		close(generation.done)
+		if err != nil {
+			return err
+		}
+		select {
+		case <-ctx.Done():
+			return nil
+		case <-generation.reset:
+		}
 	}
-	return r.runLeaderElection(ctx)
 }
 
 // leaseCheckOutcome is the result of inspecting the primary lease after the

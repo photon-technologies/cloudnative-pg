@@ -42,6 +42,8 @@ func (f fakeLeaseAcquirer) Acquire(context.Context, lease.Config) error {
 	return f.err
 }
 
+func (f fakeLeaseAcquirer) CancelCandidate(context.Context) error { return nil }
+
 var _ = Describe("verifyPgDataCoherenceForPrimary primary lease gate", func() {
 	const (
 		namespace   = "default"

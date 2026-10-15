@@ -142,6 +142,15 @@ func (r *InstanceReconciler) Reconcile(
 
 	contextLogger.Debug("Reconciling Cluster")
 
+	// Shutdown and lease lifecycle must observe admitted configuration even when
+	// a newly enabled plugin has not yet been installed in this instance.
+	r.instance.SetCluster(cluster)
+	if r.primaryLeaseAcquirer != nil && (cluster.Status.TargetPrimary != r.instance.GetPodName() || cluster.IsReplica()) {
+		if err := r.primaryLeaseAcquirer.CancelCandidate(ctx); err != nil {
+			return reconcile.Result{}, fmt.Errorf("cancelling obsolete primary candidate: %w", err)
+		}
+	}
+
 	pluginLoadingContext, cancelPluginLoading := context.WithTimeout(ctx, 5*time.Second)
 	defer cancelPluginLoading()
 
@@ -160,8 +169,6 @@ func (r *InstanceReconciler) Reconcile(
 
 	ctx = cnpgiclient.SetPluginClientInContext(ctx, pluginClient)
 	ctx = cluster.SetInContext(ctx)
-
-	r.instance.SetCluster(cluster)
 
 	// Takes care of the `.check-empty-wal-archive` file
 	if err := r.reconcileCheckWalArchiveFile(cluster); err != nil {

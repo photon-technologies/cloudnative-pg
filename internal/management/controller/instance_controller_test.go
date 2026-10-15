@@ -22,6 +22,9 @@ package controller
 import (
 	"context"
 	"errors"
+	"github.com/cloudnative-pg/cloudnative-pg/internal/cmd/manager/instance/run/lease"
+	"github.com/cloudnative-pg/cloudnative-pg/internal/cnpi/plugin/repository"
+	"k8s.io/utils/ptr"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
@@ -101,15 +104,56 @@ var _ = Describe("instance reconciler health probe certificate", func() {
 				admission:             &guard.Admission[*apiv1.Cluster]{Validator: invalidClusterValidator{}},
 			}
 
+			old := &apiv1.Cluster{Spec: apiv1.ClusterSpec{SmartShutdownTimeout: ptr.To(int32(37))}}
+			pgInstance.SetCluster(old)
 			result, err := reconciler.Reconcile(ctx, reconcile.Request{})
 
 			// The guard requeued without error: the loop short-circuited, so
 			// nothing below the guard (RefreshSecrets included) ran.
 			Expect(err).ToNot(HaveOccurred())
 			Expect(result.RequeueAfter).To(BeNumerically(">", 0))
+			Expect(pgInstance.GetClusterOrDefault()).To(BeIdenticalTo(old))
 
 			// The probe certificate was still loaded, because the load runs
 			// before the guard. This fails if the call is moved back below it.
 			Expect(pgInstance.GetServerCertificate()).ToNot(BeNil())
 		})
+})
+
+type recordingCandidateCancellation struct{ called bool }
+
+func (r *recordingCandidateCancellation) Acquire(context.Context, lease.Config) error { return nil }
+func (r *recordingCandidateCancellation) CancelCandidate(context.Context) error {
+	r.called = true
+	return nil
+}
+
+var _ = Describe("instance configuration during plugin failure", func() {
+	DescribeTable("refreshes admitted shutdown settings before a missing plugin stops reconciliation", func(ctx SpecContext, target string, wantCancellation bool) {
+		const name = "cluster-missing-plugin"
+		root, err := certs.CreateRootCA("common-name", "organization-unit")
+		Expect(err).NotTo(HaveOccurred())
+		pair, err := root.CreateAndSignPair("host", certs.CertTypeServer, nil)
+		Expect(err).NotTo(HaveOccurred())
+		secret := pair.GenerateCertificateSecret("default", name+"-server")
+		cluster := &apiv1.Cluster{
+			ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: name},
+			Spec:       apiv1.ClusterSpec{SmartShutdownTimeout: ptr.To(int32(0)), Plugins: []apiv1.PluginConfiguration{{Name: "missing-plugin", Enabled: ptr.To(true), IsWALArchiver: ptr.To(true)}}},
+			Status:     apiv1.ClusterStatus{TargetPrimary: target, PluginStatus: []apiv1.PluginStatus{{Name: "missing-plugin", Capabilities: []string{"TYPE_INSTANCE_SIDECAR_INJECTION"}}}, Certificates: apiv1.CertificatesStatus{CertificatesConfiguration: apiv1.CertificatesConfiguration{ServerTLSSecret: secret.Name}}},
+		}
+		c := fake.NewClientBuilder().WithScheme(schemeBuilder.BuildWithAllKnownScheme()).WithObjects(cluster, secret).Build()
+		instance := postgres.NewInstance().WithNamespace("default").WithPodName(name + "-1").WithClusterName(name)
+		old := cluster.DeepCopy()
+		old.Spec.SmartShutdownTimeout = ptr.To(int32(180))
+		instance.SetCluster(old)
+		cancelled := &recordingCandidateCancellation{}
+		r := &InstanceReconciler{client: c, instance: instance, primaryLeaseAcquirer: cancelled, certificateReconciler: instancecertificate.NewReconciler(c, instance), pluginRepository: repository.New()}
+		_, err = r.Reconcile(ctx, reconcile.Request{})
+		Expect(err).To(HaveOccurred())
+		Expect(instance.GetClusterOrDefault().GetSmartShutdownTimeout()).To(BeZero())
+		Expect(cancelled.called).To(Equal(wantCancellation))
+	},
+		Entry("obsolete candidate", "another-primary", true),
+		Entry("selected primary", "cluster-missing-plugin-1", false),
+	)
 })
